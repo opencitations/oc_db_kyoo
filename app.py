@@ -79,8 +79,11 @@ app = FastAPI(
 # Health and status endpoints
 app.include_router(health_router)
 
-# Include dashboard
+# Dashboard
 app.include_router(dashboard_router)
+
+# Reserved paths that must not be proxied to backends
+RESERVED_PATHS = {"health", "status", "dashboard"}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "HEAD", "OPTIONS"])
@@ -88,7 +91,10 @@ async def catch_all(request: Request, path: str):
     """
     Catch-all route: every request is proxied through to a database backend.
     The queue manager handles routing, queuing, and concurrency control.
+    Reserved paths (health, status, dashboard) are excluded from proxying.
     """
+    if path in RESERVED_PATHS:
+        return JSONResponse(status_code=404, content={"error": "Not found"})
     if _router is None:
         return JSONResponse(status_code=503, content={"error": "Service not ready"})
     return await _router.proxy_request(request)
