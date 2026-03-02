@@ -31,34 +31,33 @@ def _init_timeout_logger():
     _timeout_handler_initialized = True
 
 
-def _extract_request_info(request: Request, body: bytes) -> str:
+def _extract_request_info(request: Request, body: bytes) -> dict:
     """Extract useful debug info from the incoming request."""
     client_ip = request.client.host if request.client else "unknown"
-    method = request.method
-    path = str(request.url)
     user_agent = request.headers.get("user-agent", "unknown")
 
-    # Extract SPARQL query from body (POST) or query params (GET)
     query = ""
-    if method == "POST" and body:
+    if request.method == "POST" and body:
         try:
             decoded = body.decode("utf-8", errors="replace")
             if "query=" in decoded:
                 for part in decoded.split("&"):
                     if part.startswith("query="):
-                        query = part[6:][:500]
+                        query = part[6:]
                         break
             else:
-                query = decoded[:500]
+                query = decoded
         except Exception:
             query = "(unreadable)"
-    elif method == "GET":
-        query = request.query_params.get("query", "")[:500]
+    elif request.method == "GET":
+        query = request.query_params.get("query", "")
 
-    return (
-        f"client={client_ip} method={method} path={path} "
-        f"user_agent={user_agent} query={query}"
-    )
+    return {
+        "client": client_ip,
+        "user_agent": user_agent,
+        "method": request.method,
+        "query": query,
+    }
 
 
 BUSY_HTML = """<!DOCTYPE html>
@@ -179,10 +178,14 @@ class Router:
         except httpx.TimeoutException as e:
             duration_ms = (time.monotonic() - start_time) * 1000
             logger.warning(
-                f"[{backend_name}] BACKEND TIMEOUT after {duration_ms:.0f}ms — {request_info}"
+                f"[{backend_name}] BACKEND TIMEOUT after {duration_ms:.0f}ms"
             )
             timeout_logger.warning(
-                f"[{backend_name}] {duration_ms:.0f}ms — {request_info}"
+                f"[{backend_name}] {duration_ms:.0f}ms | "
+                f"client={request_info['client']} | "
+                f"user_agent={request_info['user_agent']}\n"
+                f"{request_info['query']}\n"
+                f"{'─' * 80}"
             )
             backend_queue.record_error()
             if isinstance(e, httpx.ConnectTimeout):
@@ -192,7 +195,7 @@ class Router:
                 status_code=504, media_type="text/plain",
             )
         except Exception as e:
-            logger.error(f"[{backend_name}] Unexpected error: {e} — {request_info}")
+            logger.error(f"[{backend_name}] Unexpected error: {e}")
             backend_queue.record_error()
             await backend_queue.record_connection_failure()
             return Response(
@@ -237,10 +240,14 @@ class Router:
             except httpx.TimeoutException as e:
                 duration_ms = (time.monotonic() - start_time) * 1000
                 logger.warning(
-                    f"[{name}] FALLBACK TIMEOUT after {duration_ms:.0f}ms — {request_info}"
+                    f"[{name}] FALLBACK TIMEOUT after {duration_ms:.0f}ms"
                 )
                 timeout_logger.warning(
-                    f"[{name}] (fallback) {duration_ms:.0f}ms — {request_info}"
+                    f"[{name}] (fallback) {duration_ms:.0f}ms | "
+                    f"client={request_info['client']} | "
+                    f"user_agent={request_info['user_agent']}\n"
+                    f"{request_info['query']}\n"
+                    f"{'─' * 80}"
                 )
                 bq.record_error()
                 if isinstance(e, httpx.ConnectTimeout):
