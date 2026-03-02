@@ -5,10 +5,10 @@ FROM python:3.11-slim
 # These can be overridden during container runtime (Docker / Kubernetes)
 ENV LISTEN_PORT="8080" \
     LOG_LEVEL="info" \
-    MAX_CONCURRENT_PER_BACKEND="20" \
+    MAX_CONCURRENT_PER_BACKEND="10" \
     MAX_QUEUE_PER_BACKEND="250" \
-    QUEUE_TIMEOUT="120" \
-    BACKEND_TIMEOUT="900"
+    QUEUE_TIMEOUT="180" \
+    BACKEND_TIMEOUT="60"
     # Backend configuration via individual env vars:
     # BACKEND_0_NAME="virtuoso-1"
     # BACKEND_0_HOST="virtuoso-1.default.svc.cluster.local"

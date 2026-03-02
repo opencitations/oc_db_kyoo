@@ -13,10 +13,16 @@
       "host": "virtuoso-2.default.svc.cluster.local",
       "port": 8890,
       "path": "/sparql"
+    },
+    {
+      "name": "virtuoso-3",
+      "host": "virtuoso-3.default.svc.cluster.local",
+      "port": 8890,
+      "path": "/sparql"
     }
   ],
-  "max_concurrent_per_backend": 20,
+  "max_concurrent_per_backend": 10,
   "max_queue_per_backend": 250,
-  "queue_timeout": 120,
-  "backend_timeout": 900
+  "queue_timeout": 180,
+  "backend_timeout": 60
 }
