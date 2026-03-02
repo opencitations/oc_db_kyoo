@@ -67,7 +67,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div id="err"></div>
 <div id="g" class="grid"><div class="empty"><p>Loading backends&hellip;</p></div></div>
 <script>
-const REFRESH=10000;
+const REFRESH=2000;
 const g=document.getElementById('g'),gs=document.getElementById('gs'),
       ts=document.getElementById('ts'),eb=document.getElementById('err');
 
