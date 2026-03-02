@@ -27,6 +27,15 @@ class AppConfig(BaseModel):
     queue_timeout: int = 120
     backend_timeout: int = 900
 
+    # Circuit breaker
+    circuit_breaker_threshold: int = 3
+    circuit_breaker_recovery_time: int = 15
+
+    # Active health check
+    health_check_interval: int = 10
+    health_check_timeout: int = 5
+    health_check_query: str = "ASK WHERE { ?s ?p ?o }"
+
     @field_validator("backends")
     @classmethod
     def check_backends_not_empty(cls, v):
@@ -46,6 +55,20 @@ class AppConfig(BaseModel):
     def check_timeout_positive(cls, v):
         if v < 1:
             raise ValueError("Timeout must be at least 1 second")
+        return v
+
+    @field_validator("circuit_breaker_threshold")
+    @classmethod
+    def check_cb_threshold(cls, v):
+        if v < 1:
+            raise ValueError("Circuit breaker threshold must be at least 1")
+        return v
+
+    @field_validator("circuit_breaker_recovery_time", "health_check_interval", "health_check_timeout")
+    @classmethod
+    def check_hc_positive(cls, v):
+        if v < 1:
+            raise ValueError("Value must be at least 1 second")
         return v
 
 
@@ -94,8 +117,16 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
     queue_timeout, qt_src = _env_or_conf("QUEUE_TIMEOUT", c.get("queue_timeout"), 120, int)
     backend_timeout, bt_src = _env_or_conf("BACKEND_TIMEOUT", c.get("backend_timeout"), 900, int)
 
+    # Circuit breaker
+    cb_threshold, cbt_src = _env_or_conf("CIRCUIT_BREAKER_THRESHOLD", c.get("circuit_breaker_threshold"), 3, int)
+    cb_recovery, cbr_src = _env_or_conf("CIRCUIT_BREAKER_RECOVERY_TIME", c.get("circuit_breaker_recovery_time"), 15, int)
+
+    # Health check
+    hc_interval, hci_src = _env_or_conf("HEALTH_CHECK_INTERVAL", c.get("health_check_interval"), 10, int)
+    hc_timeout, hct_src = _env_or_conf("HEALTH_CHECK_TIMEOUT", c.get("health_check_timeout"), 5, int)
+    hc_query, hcq_src = _env_or_conf("HEALTH_CHECK_QUERY", c.get("health_check_query"), "ASK WHERE { ?s ?p ?o }")
+
     # ── Backend discovery ───────────────────────────────────────────────
-    # Count how many BACKEND_N_HOST env vars exist
     env_backend_count = 0
     while os.getenv(f"BACKEND_{env_backend_count}_HOST"):
         env_backend_count += 1
@@ -103,8 +134,6 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
     backends_from_conf = c.get("backends", [])
 
     if env_backend_count > 0:
-        # ENV VARS WIN: backends come entirely from env vars.
-        # conf.json backends are NOT mixed in — this prevents ghost backends.
         backend_source = "env"
         backends = []
         for i in range(env_backend_count):
@@ -116,7 +145,6 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
             )
             backends.append(backend)
     elif backends_from_conf:
-        # No env vars for backends — use conf.json as-is
         backend_source = "conf.json"
         backends = [BackendConfig(**b) for b in backends_from_conf]
     else:
@@ -133,6 +161,11 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
         max_queue_per_backend=max_queue,
         queue_timeout=queue_timeout,
         backend_timeout=backend_timeout,
+        circuit_breaker_threshold=cb_threshold,
+        circuit_breaker_recovery_time=cb_recovery,
+        health_check_interval=hc_interval,
+        health_check_timeout=hc_timeout,
+        health_check_query=hc_query,
     )
 
     # ── Logging with source info ────────────────────────────────────────
@@ -145,5 +178,10 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
     logger.info(f"  max_queue_per_backend={config.max_queue_per_backend} (from {mq_src})")
     logger.info(f"  queue_timeout={config.queue_timeout}s (from {qt_src})")
     logger.info(f"  backend_timeout={config.backend_timeout}s (from {bt_src})")
+    logger.info(f"  circuit_breaker_threshold={config.circuit_breaker_threshold} (from {cbt_src})")
+    logger.info(f"  circuit_breaker_recovery_time={config.circuit_breaker_recovery_time}s (from {cbr_src})")
+    logger.info(f"  health_check_interval={config.health_check_interval}s (from {hci_src})")
+    logger.info(f"  health_check_timeout={config.health_check_timeout}s (from {hct_src})")
+    logger.info(f"  health_check_query={config.health_check_query} (from {hcq_src})")
 
     return config

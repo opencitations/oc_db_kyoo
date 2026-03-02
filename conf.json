@@ -24,5 +24,10 @@
   "max_concurrent_per_backend": 10,
   "max_queue_per_backend": 250,
   "queue_timeout": 180,
-  "backend_timeout": 60
+  "backend_timeout": 60,
+  "circuit_breaker_threshold": 3,
+  "circuit_breaker_recovery_time": 15,
+  "health_check_interval": 10,
+  "health_check_timeout": 5,
+  "health_check_query": "ASK WHERE { ?s ?p ?o }"
 }

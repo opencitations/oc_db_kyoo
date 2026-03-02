@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-db-kyoo-virtuoso
+  namespace: default
+  labels:
+    app: oc-db-kyoo-virtuoso
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oc-db-kyoo-virtuoso
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: oc-db-kyoo-virtuoso
+    spec:
+      containers:
+        - name: oc-db-kyoo-virtuoso
+          image: opencitations/oc_db_kyoo:1.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # ── General settings ─────────────────────────
+            - name: LOG_LEVEL
+              value: "info"
+            # ── Queue settings ───────────────────────────
+            - name: MAX_CONCURRENT_PER_BACKEND
+              value: "20"
+            - name: MAX_QUEUE_PER_BACKEND
+              value: "250"
+            - name: QUEUE_TIMEOUT
+              value: "180"
+            - name: BACKEND_TIMEOUT
+              value: "900"
+            # ── Circuit breaker ──────────────────────────
+            - name: CIRCUIT_BREAKER_THRESHOLD
+              value: "3"
+            - name: CIRCUIT_BREAKER_RECOVERY_TIME
+              value: "15"
+            # ── Health check probe ───────────────────────
+            - name: HEALTH_CHECK_INTERVAL
+              value: "10"
+            - name: HEALTH_CHECK_TIMEOUT
+              value: "5"
+            - name: HEALTH_CHECK_QUERY
+              value: "ASK WHERE { ?s ?p ?o }"
+            # ── Backend 0 ────────────────────────────────
+            - name: BACKEND_0_NAME
+              value: "virtuoso-1"
+            - name: BACKEND_0_HOST
+              value: "meta-db-virtuoso-1-0.virtuoso-service.default.svc.cluster.local"
+            - name: BACKEND_0_PORT
+              value: "8890"
+            - name: BACKEND_0_PATH
+              value: "/sparql"
+            # ── Backend 1 ────────────────────────────────
+            - name: BACKEND_1_NAME
+              value: "virtuoso-2"
+            - name: BACKEND_1_HOST
+              value: "meta-db-virtuoso-2-0.virtuoso-service.default.svc.cluster.local"
+            - name: BACKEND_1_PORT
+              value: "8890"
+            - name: BACKEND_1_PATH
+              value: "/sparql"
+          # ── Probes ───────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # ── Resources ────────────────────────────────────
+          resources:
+            requests:
+              cpu: 100m
+              memory: 2256Mi
+            limits:
+              cpu: 1500m
+              memory: 4512Mi
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oc-db-kyoo-virtuoso
+  namespace: default
+  labels:
+    app: oc-db-kyoo-virtuoso
+spec:
+  selector:
+    app: oc-db-kyoo-virtuoso
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP

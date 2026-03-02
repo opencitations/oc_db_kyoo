@@ -8,7 +8,12 @@ ENV LISTEN_PORT="8080" \
     MAX_CONCURRENT_PER_BACKEND="10" \
     MAX_QUEUE_PER_BACKEND="250" \
     QUEUE_TIMEOUT="180" \
-    BACKEND_TIMEOUT="60"
+    BACKEND_TIMEOUT="60" \
+    CIRCUIT_BREAKER_THRESHOLD="3" \
+    CIRCUIT_BREAKER_RECOVERY_TIME="15" \
+    HEALTH_CHECK_INTERVAL="10" \
+    HEALTH_CHECK_TIMEOUT="5" \
+    HEALTH_CHECK_QUERY="ASK WHERE { ?s ?p ?o }"
     # Backend configuration via individual env vars:
     # BACKEND_0_NAME="virtuoso-1"
     # BACKEND_0_HOST="virtuoso-1.default.svc.cluster.local"
@@ -45,4 +50,3 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 
 # Start the application with uvicorn
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "info"]
-

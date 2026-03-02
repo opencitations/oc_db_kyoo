@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI):
     _router = Router(config)
     init_health(_router.queue_manager)
 
+    # Start background tasks (health checker)
+    await _router.start()
+
     yield
 
     # Shutdown
