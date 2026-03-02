@@ -12,6 +12,55 @@ from src.queue_manager import QueueManager, BackendQueue, HealthChecker
 
 logger = logging.getLogger("oc_db_kyoo")
 
+# Dedicated logger for timeout requests — writes to file
+timeout_logger = logging.getLogger("oc_db_kyoo.timeouts")
+_timeout_handler_initialized = False
+
+
+def _init_timeout_logger():
+    global _timeout_handler_initialized
+    if _timeout_handler_initialized:
+        return
+    handler = logging.FileHandler("timeout_requests.log", mode="a")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [TIMEOUT] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    timeout_logger.addHandler(handler)
+    timeout_logger.setLevel(logging.WARNING)
+    _timeout_handler_initialized = True
+
+
+def _extract_request_info(request: Request, body: bytes) -> str:
+    """Extract useful debug info from the incoming request."""
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    path = str(request.url)
+    user_agent = request.headers.get("user-agent", "unknown")
+
+    # Extract SPARQL query from body (POST) or query params (GET)
+    query = ""
+    if method == "POST" and body:
+        try:
+            decoded = body.decode("utf-8", errors="replace")
+            if "query=" in decoded:
+                for part in decoded.split("&"):
+                    if part.startswith("query="):
+                        query = part[6:][:500]
+                        break
+            else:
+                query = decoded[:500]
+        except Exception:
+            query = "(unreadable)"
+    elif method == "GET":
+        query = request.query_params.get("query", "")[:500]
+
+    return (
+        f"client={client_ip} method={method} path={path} "
+        f"user_agent={user_agent} query={query}"
+    )
+
+
 BUSY_HTML = """<!DOCTYPE html>
 <html>
 <head><title>Service Busy</title></head>
@@ -72,6 +121,9 @@ class Router:
             follow_redirects=False,
         )
 
+        # Initialize timeout file logger
+        _init_timeout_logger()
+
     async def start(self):
         """Start background tasks (health checker)."""
         await self.health_checker.start()
@@ -100,16 +152,16 @@ class Router:
             logger.warning(f"Queue timeout for backend '{backend_name}'")
             return HTMLResponse(content=BUSY_HTML, status_code=503)
 
-        # Forward the request
+        # Read body early so we can log it on timeout
+        body = await request.body()
+        request_info = _extract_request_info(request, body)
+
         start_time = time.monotonic()
         try:
-            response = await self._forward_request(request, backend_config)
+            response = await self._forward_request(request, backend_config, body)
             duration_ms = (time.monotonic() - start_time) * 1000
             backend_queue.record_success(duration_ms)
-
-            # Connection succeeded — reset circuit breaker
             await backend_queue.record_connection_success()
-
             logger.debug(
                 f"[{backend_name}] {request.method} completed in {duration_ms:.0f}ms "
                 f"(status {response.status_code})"
@@ -122,29 +174,30 @@ class Router:
             await backend_queue.record_connection_failure()
             return Response(
                 content=f"Backend '{backend_name}' connection error",
-                status_code=502,
-                media_type="text/plain",
+                status_code=502, media_type="text/plain",
             )
         except httpx.TimeoutException as e:
-            logger.error(f"[{backend_name}] Backend timeout after {self.config.backend_timeout}s")
+            duration_ms = (time.monotonic() - start_time) * 1000
+            logger.warning(
+                f"[{backend_name}] BACKEND TIMEOUT after {duration_ms:.0f}ms — {request_info}"
+            )
+            timeout_logger.warning(
+                f"[{backend_name}] {duration_ms:.0f}ms — {request_info}"
+            )
             backend_queue.record_error()
-            # Only connect timeouts trigger the circuit breaker.
-            # Read timeouts mean the db is alive but slow.
             if isinstance(e, httpx.ConnectTimeout):
                 await backend_queue.record_connection_failure()
             return Response(
                 content=f"Backend '{backend_name}' timeout",
-                status_code=504,
-                media_type="text/plain",
+                status_code=504, media_type="text/plain",
             )
         except Exception as e:
-            logger.error(f"[{backend_name}] Unexpected error: {e}")
+            logger.error(f"[{backend_name}] Unexpected error: {e} — {request_info}")
             backend_queue.record_error()
             await backend_queue.record_connection_failure()
             return Response(
                 content="Internal proxy error",
-                status_code=500,
-                media_type="text/plain",
+                status_code=500, media_type="text/plain",
             )
         finally:
             backend_queue.release()
@@ -167,9 +220,11 @@ class Router:
                 continue
 
             backend_config = self._backend_configs[name]
+            body = await request.body()
+            request_info = _extract_request_info(request, body)
             start_time = time.monotonic()
             try:
-                response = await self._forward_request(request, backend_config)
+                response = await self._forward_request(request, backend_config, body)
                 duration_ms = (time.monotonic() - start_time) * 1000
                 bq.record_success(duration_ms)
                 await bq.record_connection_success()
@@ -179,6 +234,21 @@ class Router:
                 bq.record_error()
                 await bq.record_connection_failure()
                 return Response(content="Backend error", status_code=502, media_type="text/plain")
+            except httpx.TimeoutException as e:
+                duration_ms = (time.monotonic() - start_time) * 1000
+                logger.warning(
+                    f"[{name}] FALLBACK TIMEOUT after {duration_ms:.0f}ms — {request_info}"
+                )
+                timeout_logger.warning(
+                    f"[{name}] (fallback) {duration_ms:.0f}ms — {request_info}"
+                )
+                bq.record_error()
+                if isinstance(e, httpx.ConnectTimeout):
+                    await bq.record_connection_failure()
+                return Response(
+                    content=f"Backend '{name}' timeout",
+                    status_code=504, media_type="text/plain",
+                )
             except Exception as e:
                 logger.error(f"[{name}] Fallback error: {e}")
                 bq.record_error()
@@ -190,13 +260,11 @@ class Router:
         logger.warning("All backends busy or down (fallback exhausted) — rejecting request")
         return HTMLResponse(content=BUSY_HTML, status_code=503)
 
-    async def _forward_request(self, request: Request, backend: BackendConfig) -> Response:
+    async def _forward_request(self, request: Request, backend: BackendConfig, body: bytes) -> Response:
         """Forward the HTTP request to the target backend."""
         target_url = backend.url
         if request.url.query:
             target_url += f"?{request.url.query}"
-
-        body = await request.body()
 
         headers = dict(request.headers)
         hop_by_hop = {"host", "connection", "keep-alive", "transfer-encoding",
