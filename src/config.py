@@ -49,53 +49,81 @@ class AppConfig(BaseModel):
         return v
 
 
+def _env_or_conf(env_key: str, conf_value, default, cast=str):
+    """
+    Priority: ENV var > conf.json value > hardcoded default.
+    Returns (value, source_label) for logging.
+    """
+    env_val = os.getenv(env_key)
+    if env_val is not None:
+        return cast(env_val), "env"
+    if conf_value is not None:
+        return cast(conf_value), "conf.json"
+    return cast(default), "default"
+
+
 def load_config(config_path: str = "conf.json") -> AppConfig:
     """
-    Load configuration from conf.json, then override with Docker ENV variables.
-    Follows the same pattern as oc_api: conf.json is the base, ENV takes precedence.
+    Load configuration with strict priority:
+      1. Environment variables  (Kubernetes / Docker Compose / shell)
+      2. conf.json              (local development defaults)
+      3. Hardcoded defaults     (last resort)
+
+    Backend discovery:
+      - If ANY BACKEND_N_HOST env var is found, backends come ENTIRELY from env vars.
+        conf.json backends are ignored to prevent ghost backends.
+      - If NO BACKEND_N_HOST env vars exist, backends come from conf.json.
     """
 
-    # Load conf.json
-    with open(config_path) as f:
-        c = json.load(f)
+    # ── Load conf.json as base ──────────────────────────────────────────
+    c = {}
+    try:
+        with open(config_path) as f:
+            c = json.load(f)
+        logger.info(f"Loaded base config from {config_path}")
+    except FileNotFoundError:
+        logger.warning(f"{config_path} not found — using env vars and defaults only")
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in {config_path}: {e} — using env vars and defaults only")
 
-    # ENV overrides (Docker / Kubernetes)
-    listen_port = int(os.getenv("LISTEN_PORT", c.get("listen_port", 8080)))
-    log_level = os.getenv("LOG_LEVEL", c.get("log_level", "info"))
-    max_concurrent = int(os.getenv("MAX_CONCURRENT_PER_BACKEND", c.get("max_concurrent_per_backend", 10)))
-    max_queue = int(os.getenv("MAX_QUEUE_PER_BACKEND", c.get("max_queue_per_backend", 50)))
-    queue_timeout = int(os.getenv("QUEUE_TIMEOUT", c.get("queue_timeout", 120)))
-    backend_timeout = int(os.getenv("BACKEND_TIMEOUT", c.get("backend_timeout", 900)))
+    # ── Global settings (env > conf.json > default) ─────────────────────
+    listen_port, lp_src = _env_or_conf("LISTEN_PORT", c.get("listen_port"), 8080, int)
+    log_level, ll_src = _env_or_conf("LOG_LEVEL", c.get("log_level"), "info")
+    max_concurrent, mc_src = _env_or_conf("MAX_CONCURRENT_PER_BACKEND", c.get("max_concurrent_per_backend"), 10, int)
+    max_queue, mq_src = _env_or_conf("MAX_QUEUE_PER_BACKEND", c.get("max_queue_per_backend"), 50, int)
+    queue_timeout, qt_src = _env_or_conf("QUEUE_TIMEOUT", c.get("queue_timeout"), 120, int)
+    backend_timeout, bt_src = _env_or_conf("BACKEND_TIMEOUT", c.get("backend_timeout"), 900, int)
 
-    # Backends configuration priority:
-    # 1. Individual env vars: BACKEND_0_HOST, BACKEND_1_HOST, etc. (Kubernetes-friendly)
-    # 2. Fall back to conf.json "backends" list for any missing values
-    #
-    # Discovery: scan BACKEND_N_HOST env vars to find how many backends are defined.
-    # If no env vars are found, use conf.json backends as-is.
-
-    backends_from_conf = c.get("backends", [])
-
-    # Discover backends from env vars (BACKEND_0_HOST, BACKEND_1_HOST, ...)
+    # ── Backend discovery ───────────────────────────────────────────────
+    # Count how many BACKEND_N_HOST env vars exist
     env_backend_count = 0
     while os.getenv(f"BACKEND_{env_backend_count}_HOST"):
         env_backend_count += 1
 
-    # Determine how many backends we have
-    num_backends = max(env_backend_count, len(backends_from_conf))
+    backends_from_conf = c.get("backends", [])
 
-    backends = []
-    for i in range(num_backends):
-        # Get conf.json defaults for this index (if available)
-        conf_defaults = backends_from_conf[i] if i < len(backends_from_conf) else {}
-
-        backend = BackendConfig(
-            name=os.getenv(f"BACKEND_{i}_NAME", conf_defaults.get("name", f"backend-{i}")),
-            host=os.getenv(f"BACKEND_{i}_HOST", conf_defaults.get("host", "localhost")),
-            port=int(os.getenv(f"BACKEND_{i}_PORT", conf_defaults.get("port", 8890))),
-            path=os.getenv(f"BACKEND_{i}_PATH", conf_defaults.get("path", "/")),
+    if env_backend_count > 0:
+        # ENV VARS WIN: backends come entirely from env vars.
+        # conf.json backends are NOT mixed in — this prevents ghost backends.
+        backend_source = "env"
+        backends = []
+        for i in range(env_backend_count):
+            backend = BackendConfig(
+                name=os.getenv(f"BACKEND_{i}_NAME", f"backend-{i}"),
+                host=os.getenv(f"BACKEND_{i}_HOST"),
+                port=int(os.getenv(f"BACKEND_{i}_PORT", 8890)),
+                path=os.getenv(f"BACKEND_{i}_PATH", "/"),
+            )
+            backends.append(backend)
+    elif backends_from_conf:
+        # No env vars for backends — use conf.json as-is
+        backend_source = "conf.json"
+        backends = [BackendConfig(**b) for b in backends_from_conf]
+    else:
+        raise ValueError(
+            "No backends configured. Set BACKEND_0_HOST env var "
+            "or add backends to conf.json."
         )
-        backends.append(backend)
 
     config = AppConfig(
         listen_port=listen_port,
@@ -107,12 +135,15 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
         backend_timeout=backend_timeout,
     )
 
-    logger.info(f"Configuration loaded: {len(config.backends)} backends")
+    # ── Logging with source info ────────────────────────────────────────
+    logger.info(f"Configuration resolved ({len(config.backends)} backends from {backend_source}):")
     for b in config.backends:
         logger.info(f"  Backend '{b.name}': {b.url}")
-    logger.info(f"  Max concurrent per backend: {config.max_concurrent_per_backend}")
-    logger.info(f"  Max queue per backend: {config.max_queue_per_backend}")
-    logger.info(f"  Queue timeout: {config.queue_timeout}s")
-    logger.info(f"  Backend timeout: {config.backend_timeout}s")
+    logger.info(f"  listen_port={config.listen_port} (from {lp_src})")
+    logger.info(f"  log_level={config.log_level} (from {ll_src})")
+    logger.info(f"  max_concurrent_per_backend={config.max_concurrent_per_backend} (from {mc_src})")
+    logger.info(f"  max_queue_per_backend={config.max_queue_per_backend} (from {mq_src})")
+    logger.info(f"  queue_timeout={config.queue_timeout}s (from {qt_src})")
+    logger.info(f"  backend_timeout={config.backend_timeout}s (from {bt_src})")
 
     return config
