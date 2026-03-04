@@ -29,6 +29,7 @@ ENV PYTHONUNBUFFERED=1
 
 # Install system dependencies
 RUN apt-get update && \
+    apt-get install curl -y \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
