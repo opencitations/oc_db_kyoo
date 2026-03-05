@@ -36,6 +36,13 @@ class AppConfig(BaseModel):
     health_check_timeout: int = 5
     health_check_query: str = "ASK WHERE { ?s ?p ?o }"
 
+    # Fallback backends (activated only when ALL primary backends are down)
+    fallback_backends: List[BackendConfig] = []
+    fallback_max_concurrent_per_backend: int = 3
+    fallback_max_queue_per_backend: int = 20
+    fallback_queue_timeout: int = 120
+    fallback_backend_timeout: int = 120
+
     @field_validator("backends")
     @classmethod
     def check_backends_not_empty(cls, v):
@@ -43,14 +50,16 @@ class AppConfig(BaseModel):
             raise ValueError("At least one backend must be configured")
         return v
 
-    @field_validator("max_concurrent_per_backend", "max_queue_per_backend")
+    @field_validator("max_concurrent_per_backend", "max_queue_per_backend",
+                     "fallback_max_concurrent_per_backend", "fallback_max_queue_per_backend")
     @classmethod
     def check_positive(cls, v):
         if v < 1:
             raise ValueError("Value must be at least 1")
         return v
 
-    @field_validator("queue_timeout", "backend_timeout")
+    @field_validator("queue_timeout", "backend_timeout",
+                     "fallback_queue_timeout", "fallback_backend_timeout")
     @classmethod
     def check_timeout_positive(cls, v):
         if v < 1:
@@ -93,23 +102,23 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
       3. Hardcoded defaults     (last resort)
 
     Backend discovery:
-      - If ANY BACKEND_N_HOST env var is found, backends come ENTIRELY from env vars.
-        conf.json backends are ignored to prevent ghost backends.
-      - If NO BACKEND_N_HOST env vars exist, backends come from conf.json.
+      - Primary: BACKEND_N_HOST env vars (N=0,1,2,...)
+      - Fallback: FALLBACK_N_HOST env vars (N=0,1,2,...)
+      - If env vars exist for a pool, conf.json backends for that pool are ignored.
     """
 
-    # ── Load conf.json as base ──────────────────────────────────────────
+    # -- Load conf.json as base
     c = {}
     try:
         with open(config_path) as f:
             c = json.load(f)
         logger.info(f"Loaded base config from {config_path}")
     except FileNotFoundError:
-        logger.warning(f"{config_path} not found — using env vars and defaults only")
+        logger.warning(f"{config_path} not found - using env vars and defaults only")
     except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in {config_path}: {e} — using env vars and defaults only")
+        logger.error(f"Invalid JSON in {config_path}: {e} - using env vars and defaults only")
 
-    # ── Global settings (env > conf.json > default) ─────────────────────
+    # -- Global settings (env > conf.json > default)
     listen_port, lp_src = _env_or_conf("LISTEN_PORT", c.get("listen_port"), 8080, int)
     log_level, ll_src = _env_or_conf("LOG_LEVEL", c.get("log_level"), "info")
     max_concurrent, mc_src = _env_or_conf("MAX_CONCURRENT_PER_BACKEND", c.get("max_concurrent_per_backend"), 10, int)
@@ -126,7 +135,13 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
     hc_timeout, hct_src = _env_or_conf("HEALTH_CHECK_TIMEOUT", c.get("health_check_timeout"), 5, int)
     hc_query, hcq_src = _env_or_conf("HEALTH_CHECK_QUERY", c.get("health_check_query"), "ASK WHERE { ?s ?p ?o }")
 
-    # ── Backend discovery ───────────────────────────────────────────────
+    # Fallback pool settings
+    fb_max_concurrent, fmc_src = _env_or_conf("FALLBACK_MAX_CONCURRENT_PER_BACKEND", c.get("fallback_max_concurrent_per_backend"), 3, int)
+    fb_max_queue, fmq_src = _env_or_conf("FALLBACK_MAX_QUEUE_PER_BACKEND", c.get("fallback_max_queue_per_backend"), 20, int)
+    fb_queue_timeout, fqt_src = _env_or_conf("FALLBACK_QUEUE_TIMEOUT", c.get("fallback_queue_timeout"), 120, int)
+    fb_backend_timeout, fbt_src = _env_or_conf("FALLBACK_BACKEND_TIMEOUT", c.get("fallback_backend_timeout"), 120, int)
+
+    # -- Primary backend discovery
     env_backend_count = 0
     while os.getenv(f"BACKEND_{env_backend_count}_HOST"):
         env_backend_count += 1
@@ -153,6 +168,31 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
             "or add backends to conf.json."
         )
 
+    # -- Fallback backend discovery
+    env_fallback_count = 0
+    while os.getenv(f"FALLBACK_{env_fallback_count}_HOST"):
+        env_fallback_count += 1
+
+    fallback_from_conf = c.get("fallback_backends", [])
+
+    if env_fallback_count > 0:
+        fallback_source = "env"
+        fallback_backends = []
+        for i in range(env_fallback_count):
+            fb = BackendConfig(
+                name=os.getenv(f"FALLBACK_{i}_NAME", f"fallback-{i}"),
+                host=os.getenv(f"FALLBACK_{i}_HOST"),
+                port=int(os.getenv(f"FALLBACK_{i}_PORT", 8890)),
+                path=os.getenv(f"FALLBACK_{i}_PATH", "/"),
+            )
+            fallback_backends.append(fb)
+    elif fallback_from_conf:
+        fallback_source = "conf.json"
+        fallback_backends = [BackendConfig(**b) for b in fallback_from_conf]
+    else:
+        fallback_source = "none"
+        fallback_backends = []
+
     config = AppConfig(
         listen_port=listen_port,
         log_level=log_level,
@@ -166,12 +206,17 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
         health_check_interval=hc_interval,
         health_check_timeout=hc_timeout,
         health_check_query=hc_query,
+        fallback_backends=fallback_backends,
+        fallback_max_concurrent_per_backend=fb_max_concurrent,
+        fallback_max_queue_per_backend=fb_max_queue,
+        fallback_queue_timeout=fb_queue_timeout,
+        fallback_backend_timeout=fb_backend_timeout,
     )
 
-    # ── Logging with source info ────────────────────────────────────────
-    logger.info(f"Configuration resolved ({len(config.backends)} backends from {backend_source}):")
+    # -- Logging with source info
+    logger.info(f"Configuration resolved ({len(config.backends)} primary backends from {backend_source}):")
     for b in config.backends:
-        logger.info(f"  Backend '{b.name}': {b.url}")
+        logger.info(f"  Primary '{b.name}': {b.url}")
     logger.info(f"  listen_port={config.listen_port} (from {lp_src})")
     logger.info(f"  log_level={config.log_level} (from {ll_src})")
     logger.info(f"  max_concurrent_per_backend={config.max_concurrent_per_backend} (from {mc_src})")
@@ -183,5 +228,16 @@ def load_config(config_path: str = "conf.json") -> AppConfig:
     logger.info(f"  health_check_interval={config.health_check_interval}s (from {hci_src})")
     logger.info(f"  health_check_timeout={config.health_check_timeout}s (from {hct_src})")
     logger.info(f"  health_check_query={config.health_check_query} (from {hcq_src})")
+
+    if fallback_backends:
+        logger.info(f"Fallback pool ({len(fallback_backends)} backends from {fallback_source}):")
+        for b in fallback_backends:
+            logger.info(f"  Fallback '{b.name}': {b.url}")
+        logger.info(f"  fallback_max_concurrent={fb_max_concurrent} (from {fmc_src})")
+        logger.info(f"  fallback_max_queue={fb_max_queue} (from {fmq_src})")
+        logger.info(f"  fallback_queue_timeout={fb_queue_timeout}s (from {fqt_src})")
+        logger.info(f"  fallback_backend_timeout={fb_backend_timeout}s (from {fbt_src})")
+    else:
+        logger.info("No fallback backends configured")
 
     return config

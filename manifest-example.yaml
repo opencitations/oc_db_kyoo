@@ -102,7 +102,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: oc-db-kyoo-virtuoso
+  name: oc-db-kyoo-virtuoso-service
   namespace: default
   labels:
     app: oc-db-kyoo-virtuoso
@@ -111,7 +111,128 @@ spec:
     app: oc-db-kyoo-virtuoso
   ports:
     - name: http
-      port: 8080
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+
+
+---
+#esempio per qlever
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oc-db-kyoo-qleverindex
+  namespace: default
+  labels:
+    app: oc-db-kyoo-qleverindex
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oc-db-kyoo-qleverindex
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: oc-db-kyoo-qleverindex
+    spec:
+      containers:
+        - name: oc-db-kyoo-qleverindex
+          image: opencitations/oc_db_kyoo:r2test-1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # ── General settings ─────────────────────────
+            - name: LOG_LEVEL
+              value: "info"
+            # ── Queue settings ───────────────────────────
+            - name: MAX_CONCURRENT_PER_BACKEND
+              value: "20"
+            - name: MAX_QUEUE_PER_BACKEND
+              value: "250"
+            - name: QUEUE_TIMEOUT
+              value: "180"
+            - name: BACKEND_TIMEOUT
+              value: "45"
+            # ── Circuit breaker ──────────────────────────
+            - name: CIRCUIT_BREAKER_THRESHOLD
+              value: "3"
+            - name: CIRCUIT_BREAKER_RECOVERY_TIME
+              value: "15"
+            # ── Health check probe ───────────────────────
+            - name: HEALTH_CHECK_INTERVAL
+              value: "10"
+            - name: HEALTH_CHECK_TIMEOUT
+              value: "5"
+            - name: HEALTH_CHECK_QUERY
+              value: "PREFIX cito: <http://purl.org/spar/cito/> ASK { ?citation cito:hasCitedEntity <https://w3id.org/oc/meta/br/062501777134> . }"
+            # ── Backend 0 ────────────────────────────────
+            - name: BACKEND_0_NAME
+              value: "index-1"
+            - name: BACKEND_0_HOST
+              value: "index-db-qlever-1-0.qlever-service.default.svc.cluster.local"
+            - name: BACKEND_0_PORT
+              value: "7011"
+            - name: BACKEND_0_PATH
+              value: "/"
+            # ── Backend 1 ────────────────────────────────
+            - name: BACKEND_1_NAME
+              value: "index-2"
+            - name: BACKEND_1_HOST
+              value: "index-db-qlever-2-0.qlever-service.default.svc.cluster.local"
+            - name: BACKEND_1_PORT
+              value: "7011"
+            - name: BACKEND_1_PATH
+              value: "/"
+          # ── Probes ───────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # ── Resources ────────────────────────────────────
+          resources:
+            requests:
+              cpu: 2
+              memory: 4Gi
+            limits:
+              cpu: 3
+              memory: 8Gi
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oc-db-kyoo-qleverindex-service
+  namespace: default
+  labels:
+    app: oc-db-kyoo-qleverindex
+spec:
+  selector:
+    app: oc-db-kyoo-qleverindex
+  ports:
+    - name: http
+      port: 80
       targetPort: 8080
       protocol: TCP
   type: ClusterIP

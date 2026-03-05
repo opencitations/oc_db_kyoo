@@ -21,7 +21,7 @@ def init_health(queue_manager: QueueManager):
 async def health():
     """
     Liveness/readiness probe for Kubernetes.
-    Returns 200 if the service is running and at least one backend can accept requests.
+    Returns 200 if at least one backend (primary or fallback) can accept requests.
     Returns 503 if all backends are overloaded.
     """
     if _queue_manager is None:
@@ -46,7 +46,7 @@ async def health():
 async def status():
     """
     Detailed status endpoint showing per-backend queue statistics.
-    Useful for debugging and monitoring.
+    Includes both primary and fallback pools.
     """
     if _queue_manager is None:
         return JSONResponse(
@@ -54,10 +54,13 @@ async def status():
             content={"status": "error", "message": "Service not initialized"}
         )
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "ok" if _queue_manager.is_healthy() else "overloaded",
-            "backends": _queue_manager.all_stats(),
-        }
-    )
+    response = {
+        "status": "ok" if _queue_manager.is_healthy() else "overloaded",
+        "backends": _queue_manager.all_stats(),
+    }
+
+    if _queue_manager.has_fallback:
+        response["all_primaries_down"] = _queue_manager._all_primaries_down()
+        response["fallback_backends"] = _queue_manager.all_fallback_stats()
+
+    return JSONResponse(status_code=200, content=response)

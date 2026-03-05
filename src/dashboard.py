@@ -75,6 +75,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .summary{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}
   .summary-item{display:flex;align-items:center;gap:8px;padding:8px 16px;border-radius:8px;background:var(--surface);border:1px solid var(--border);font-size:0.82rem}
   .summary-count{font-weight:700;font-size:1.1rem;font-variant-numeric:tabular-nums}
+
+  /* Section headers */
+  .section-hd{display:flex;align-items:center;gap:12px;margin:28px 0 16px;font-size:0.85rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em}
+  .section-hd::after{content:'';flex:1;height:1px;background:var(--border)}
+  .section-tag{font-size:0.7rem;padding:3px 10px;border-radius:10px;font-weight:600;letter-spacing:0.04em}
+  .tag-primary{background:rgba(96,165,250,0.12);color:var(--blue)}
+  .tag-fallback{background:rgba(251,146,60,0.12);color:var(--orange)}
+
+  /* Fallback activation banner */
+  .fb-banner{display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:8px;margin-bottom:20px;font-size:0.85rem;font-weight:500}
+  .fb-active{background:rgba(251,146,60,0.12);border:1px solid rgba(251,146,60,0.3);color:var(--orange)}
+  .fb-standby{background:rgba(139,143,163,0.08);border:1px solid var(--border);color:var(--muted)}
 </style>
 </head>
 <body>
@@ -87,18 +99,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </header>
 <div id="err"></div>
 <div id="summary" class="summary"></div>
-<div id="g" class="grid"><div class="empty"><p>Loading backends&hellip;</p></div></div>
+<div id="content"></div>
 <script>
-const REFRESH=2000;
-const g=document.getElementById('g'),gs=document.getElementById('gs'),
-      ts=document.getElementById('ts'),eb=document.getElementById('err'),
-      sm=document.getElementById('summary');
+var REFRESH=2000;
+var cnt=document.getElementById('content'),gs=document.getElementById('gs'),
+    ts=document.getElementById('ts'),eb=document.getElementById('err'),
+    sm=document.getElementById('summary');
 
 function fmt(n){return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n)}
 function bc(r){return r<.5?'b-lo':r<.8?'b-mi':'b-hi'}
 function mc(r){return r<.5?'var(--green)':r<.8?'var(--yellow)':'var(--red)'}
 
-/* SVG icons for circuit states */
 var icons={
   closed:'<svg class="circuit-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="7"/><path d="M7 10l2 2 4-4"/></svg>',
   open:'<svg class="circuit-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="7"/><path d="M7.5 7.5l5 5M12.5 7.5l-5 5"/></svg>',
@@ -106,9 +117,9 @@ var icons={
 };
 
 var circuitLabels={
-  closed:'Circuit CLOSED — operational',
-  open:'Circuit OPEN — backend down',
-  half_open:'Circuit HALF_OPEN — testing recovery'
+  closed:'Circuit CLOSED \u2014 operational',
+  open:'Circuit OPEN \u2014 backend down',
+  half_open:'Circuit HALF_OPEN \u2014 testing recovery'
 };
 
 function circuitHtml(b){
@@ -147,9 +158,10 @@ function card(b){
     '</div></div>';
 }
 
-function summaryBar(backends){
+function summaryBar(primaries, fallbacks){
+  var all=primaries.concat(fallbacks||[]);
   var closed=0,open=0,half=0;
-  backends.forEach(function(b){
+  all.forEach(function(b){
     var cs=b.circuit_state||'closed';
     if(cs==='closed') closed++;
     else if(cs==='open') open++;
@@ -170,9 +182,39 @@ async function poll(){
     eb.style.display='none';
     var st=d.status||'unknown';
     gs.innerHTML='<span class="pill '+(st==='ok'?'pill-ok':'pill-bad')+'"><span class="dot"></span>'+st+'</span>';
+
     var bk=d.backends||[];
-    sm.innerHTML=bk.length?summaryBar(bk):'';
-    g.innerHTML=bk.length?bk.map(card).join(''):'<div class="empty"><p>No backends.</p></div>';
+    var fb=d.fallback_backends||[];
+    var allDown=d.all_primaries_down||false;
+
+    sm.innerHTML=(bk.length||fb.length)?summaryBar(bk,fb):'';
+
+    var h='';
+
+    /* Primary backends */
+    if(fb.length>0){
+      h+='<div class="section-hd"><span class="section-tag tag-primary">Primary</span> Backends</div>';
+    }
+    h+='<div class="grid">';
+    h+=bk.length?bk.map(card).join(''):'<div class="empty"><p>No primary backends.</p></div>';
+    h+='</div>';
+
+    /* Fallback backends */
+    if(fb.length>0){
+      h+='<div class="section-hd"><span class="section-tag tag-fallback">Fallback</span> Reserve Backends</div>';
+
+      if(allDown){
+        h+='<div class="fb-banner fb-active">'+icons.open+' All primaries are down \u2014 fallback pool is <strong>&nbsp;ACTIVE</strong></div>';
+      } else {
+        h+='<div class="fb-banner fb-standby">\u23F8 Fallback pool on standby \u2014 primaries are handling traffic</div>';
+      }
+
+      h+='<div class="grid">';
+      h+=fb.map(card).join('');
+      h+='</div>';
+    }
+
+    cnt.innerHTML=h;
     ts.textContent='Updated '+new Date().toLocaleTimeString();
   }catch(e){
     eb.textContent='Failed to fetch /status \u2014 '+e.message;

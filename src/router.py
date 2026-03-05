@@ -12,7 +12,7 @@ from src.queue_manager import QueueManager, BackendQueue, HealthChecker
 
 logger = logging.getLogger("oc_db_kyoo")
 
-# Dedicated logger for timeout requests — writes to file
+# Dedicated logger for timeout requests
 timeout_logger = logging.getLogger("oc_db_kyoo.timeouts")
 _timeout_handler_initialized = False
 
@@ -73,16 +73,21 @@ BUSY_HTML = """<!DOCTYPE html>
 class Router:
     """
     Receives incoming HTTP requests and proxies them to database backends
-    through the QueueManager (least-queue routing with circuit breaker).
+    through the QueueManager (two-tier routing: primary + fallback pool).
     """
 
     def __init__(self, config: AppConfig):
         self.config = config
 
-        # Map backend name -> BackendConfig
+        # Map backend name -> BackendConfig (primary + fallback)
         self._backend_configs: Dict[str, BackendConfig] = {}
         for b in config.backends:
             self._backend_configs[b.name] = b
+        for b in config.fallback_backends:
+            self._backend_configs[b.name] = b
+
+        # Track which backends are fallback (for choosing the right HTTP client)
+        self._fallback_names = {b.name for b in config.fallback_backends}
 
         # Queue manager with circuit breaker
         self.queue_manager = QueueManager(
@@ -95,8 +100,20 @@ class Router:
         for b in config.backends:
             self.queue_manager.add_backend(b.name)
 
-        # Health checker for probing OPEN backends
+        # Fallback pool
+        if config.fallback_backends:
+            self.queue_manager.configure_fallback_pool(
+                max_concurrent=config.fallback_max_concurrent_per_backend,
+                max_queue=config.fallback_max_queue_per_backend,
+                queue_timeout=config.fallback_queue_timeout,
+            )
+            for b in config.fallback_backends:
+                self.queue_manager.add_fallback_backend(b.name)
+
+        # Health checker — URLs for all backends (primary + fallback)
         backend_urls = {b.name: b.url for b in config.backends}
+        for b in config.fallback_backends:
+            backend_urls[b.name] = b.url
         self.health_checker = HealthChecker(
             queue_manager=self.queue_manager,
             backend_urls=backend_urls,
@@ -105,7 +122,8 @@ class Router:
             query=config.health_check_query,
         )
 
-        # Async HTTP client
+        # Primary HTTP client
+        total_primary = len(config.backends) * config.max_concurrent_per_backend
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=10.0,
@@ -114,29 +132,53 @@ class Router:
                 pool=float(config.backend_timeout),
             ),
             limits=httpx.Limits(
-                max_connections=len(config.backends) * config.max_concurrent_per_backend * 2,
-                max_keepalive_connections=len(config.backends) * config.max_concurrent_per_backend,
+                max_connections=total_primary * 2,
+                max_keepalive_connections=total_primary,
             ),
             follow_redirects=False,
         )
 
-        # Initialize timeout file logger
+        # Fallback HTTP client (separate timeout)
+        if config.fallback_backends:
+            total_fallback = len(config.fallback_backends) * config.fallback_max_concurrent_per_backend
+            self._fallback_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=float(config.fallback_backend_timeout),
+                    write=10.0,
+                    pool=float(config.fallback_backend_timeout),
+                ),
+                limits=httpx.Limits(
+                    max_connections=total_fallback * 2,
+                    max_keepalive_connections=total_fallback,
+                ),
+                follow_redirects=False,
+            )
+        else:
+            self._fallback_client = None
+
         _init_timeout_logger()
 
+    def _get_client(self, backend_name: str) -> httpx.AsyncClient:
+        """Return the appropriate HTTP client for the backend."""
+        if backend_name in self._fallback_names and self._fallback_client:
+            return self._fallback_client
+        return self._client
+
     async def start(self):
-        """Start background tasks (health checker)."""
         await self.health_checker.start()
 
     async def close(self):
-        """Shutdown: stop health checker, close HTTP client."""
         await self.health_checker.stop()
         await self._client.aclose()
+        if self._fallback_client:
+            await self._fallback_client.aclose()
 
     async def proxy_request(self, request: Request) -> Response:
-        """Main entry point: route request to the least-loaded available backend."""
+        """Main entry point: route request to the best available backend."""
         backend_queue = self.queue_manager.select_backend()
         if backend_queue is None:
-            logger.warning("All backends busy or down — rejecting request")
+            logger.warning("All backends busy or down - rejecting request")
             return HTMLResponse(content=BUSY_HTML, status_code=503)
 
         backend_name = backend_queue.name
@@ -157,7 +199,7 @@ class Router:
 
         start_time = time.monotonic()
         try:
-            response = await self._forward_request(request, backend_config, body)
+            response = await self._forward_request(request, backend_config, body, backend_name)
             duration_ms = (time.monotonic() - start_time) * 1000
             backend_queue.record_success(duration_ms)
             await backend_queue.record_connection_success()
@@ -188,9 +230,6 @@ class Router:
                 f"{'─' * 80}"
             )
             backend_queue.record_error()
-            # ALL timeouts count as connection failures for the circuit breaker.
-            # A backend that accepts TCP but never responds is just as dead
-            # as one that refuses connections.
             await backend_queue.record_connection_failure()
             return Response(
                 content=f"Backend '{backend_name}' timeout",
@@ -208,8 +247,12 @@ class Router:
             backend_queue.release()
 
     async def _try_fallback_backends(self, request: Request, exclude: str) -> Response:
-        """Try other available backends if the first choice was full."""
-        for name, bq in self.queue_manager._backends.items():
+        """Try other available backends (primary + fallback) if the first choice was full."""
+        # Collect all backend queues from both pools
+        all_queues = list(self.queue_manager._backends.items()) + \
+                     list(self.queue_manager._fallback_backends.items())
+
+        for name, bq in all_queues:
             if name == exclude:
                 continue
             if not bq.is_available:
@@ -229,7 +272,7 @@ class Router:
             request_info = _extract_request_info(request, body)
             start_time = time.monotonic()
             try:
-                response = await self._forward_request(request, backend_config, body)
+                response = await self._forward_request(request, backend_config, body, name)
                 duration_ms = (time.monotonic() - start_time) * 1000
                 bq.record_success(duration_ms)
                 await bq.record_connection_success()
@@ -252,7 +295,6 @@ class Router:
                     f"{'─' * 80}"
                 )
                 bq.record_error()
-                # ALL timeouts trigger circuit breaker (same fix as primary path)
                 await bq.record_connection_failure()
                 return Response(
                     content=f"Backend '{name}' timeout",
@@ -266,10 +308,11 @@ class Router:
             finally:
                 bq.release()
 
-        logger.warning("All backends busy or down (fallback exhausted) — rejecting request")
+        logger.warning("All backends busy or down (fallback exhausted) - rejecting request")
         return HTMLResponse(content=BUSY_HTML, status_code=503)
 
-    async def _forward_request(self, request: Request, backend: BackendConfig, body: bytes) -> Response:
+    async def _forward_request(self, request: Request, backend: BackendConfig,
+                               body: bytes, backend_name: str) -> Response:
         """Forward the HTTP request to the target backend."""
         target_url = backend.url
         if request.url.query:
@@ -285,7 +328,8 @@ class Router:
         }
         forward_headers["host"] = f"{backend.host}:{backend.port}"
 
-        resp = await self._client.request(
+        client = self._get_client(backend_name)
+        resp = await client.request(
             method=request.method,
             url=target_url,
             headers=forward_headers,

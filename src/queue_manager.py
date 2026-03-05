@@ -325,9 +325,14 @@ class HealthChecker:
                 logger.error(f"Health checker error: {e}")
 
     async def _check_open_backends(self):
-        """Probe all OPEN backends concurrently."""
+        """Probe all OPEN backends (primary + fallback) concurrently."""
         open_backends = [
             bq for bq in self._qm._backends.values()
+            if bq.circuit_state == CircuitState.OPEN
+        ]
+        # Also check fallback backends
+        open_backends += [
+            bq for bq in self._qm._fallback_backends.values()
             if bq.circuit_state == CircuitState.OPEN
         ]
         if not open_backends:
@@ -369,7 +374,12 @@ class HealthChecker:
 
 class QueueManager:
     """
-    Manages multiple backend queues with least-queue routing and circuit breaker.
+    Manages two pools of backend queues:
+      - Primary pool: normal backends, used first
+      - Fallback pool: reserve backends, used only when ALL primaries are down (circuit OPEN)
+
+    Each pool has independent concurrency/queue/timeout settings.
+    Both pools have circuit breaker and health checking.
     """
 
     def __init__(self, max_concurrent: int, max_queue: int, queue_timeout: int,
@@ -380,6 +390,19 @@ class QueueManager:
         self.cb_threshold = cb_threshold
         self.cb_recovery_time = cb_recovery_time
         self._backends: Dict[str, BackendQueue] = {}
+
+        # Fallback pool — separate limits
+        self._fallback_backends: Dict[str, BackendQueue] = {}
+        self._fallback_max_concurrent = 3
+        self._fallback_max_queue = 20
+        self._fallback_queue_timeout = 120
+
+    def configure_fallback_pool(self, max_concurrent: int, max_queue: int,
+                                queue_timeout: int):
+        """Set limits for the fallback pool (called before adding fallback backends)."""
+        self._fallback_max_concurrent = max_concurrent
+        self._fallback_max_queue = max_queue
+        self._fallback_queue_timeout = queue_timeout
 
     def add_backend(self, name: str) -> BackendQueue:
         bq = BackendQueue(
@@ -392,7 +415,7 @@ class QueueManager:
         )
         self._backends[name] = bq
         logger.info(
-            f"Backend '{name}' registered: "
+            f"Primary backend '{name}' registered: "
             f"max_concurrent={self.max_concurrent}, "
             f"max_queue={self.max_queue}, "
             f"queue_timeout={self.queue_timeout}s, "
@@ -401,32 +424,100 @@ class QueueManager:
         )
         return bq
 
-    def get_backend(self, name: str) -> Optional[BackendQueue]:
-        return self._backends.get(name)
+    def add_fallback_backend(self, name: str) -> BackendQueue:
+        bq = BackendQueue(
+            name=name,
+            max_concurrent=self._fallback_max_concurrent,
+            max_queue=self._fallback_max_queue,
+            queue_timeout=self._fallback_queue_timeout,
+            cb_threshold=self.cb_threshold,
+            cb_recovery_time=self.cb_recovery_time,
+        )
+        self._fallback_backends[name] = bq
+        logger.info(
+            f"Fallback backend '{name}' registered: "
+            f"max_concurrent={self._fallback_max_concurrent}, "
+            f"max_queue={self._fallback_max_queue}, "
+            f"queue_timeout={self._fallback_queue_timeout}s, "
+            f"cb_threshold={self.cb_threshold}, "
+            f"cb_recovery={self.cb_recovery_time}s"
+        )
+        return bq
 
-    def select_backend(self) -> Optional[BackendQueue]:
-        """
-        Select the backend with the lowest total load among AVAILABLE backends.
-        Skips backends with open circuit breaker.
-        """
+    def get_backend(self, name: str) -> Optional[BackendQueue]:
+        return self._backends.get(name) or self._fallback_backends.get(name)
+
+    def _all_primaries_down(self) -> bool:
+        """True if every primary backend has its circuit OPEN."""
+        return all(
+            bq.circuit_state == CircuitState.OPEN
+            for bq in self._backends.values()
+        )
+
+    def _select_from_pool(self, pool: Dict[str, BackendQueue]) -> Optional[BackendQueue]:
+        """Pick the least-loaded available backend from a pool."""
         available = [
-            bq for bq in self._backends.values()
+            bq for bq in pool.values()
             if bq.is_available and (not bq.is_queue_full() or not bq._semaphore.locked())
         ]
         if not available:
             return None
         return min(available, key=lambda bq: bq.total_load)
 
+    def select_backend(self) -> Optional[BackendQueue]:
+        """
+        Two-tier routing:
+          1. Try primary pool first
+          2. If ALL primaries are down (circuit OPEN), try fallback pool
+        """
+        primary = self._select_from_pool(self._backends)
+        if primary is not None:
+            return primary
+
+        # Only use fallback if ALL primaries have open circuits
+        if self._fallback_backends and self._all_primaries_down():
+            fallback = self._select_from_pool(self._fallback_backends)
+            if fallback is not None:
+                logger.info(
+                    f"All primaries down — routing to fallback '{fallback.name}'"
+                )
+                return fallback
+
+        return None
+
     def all_stats(self) -> list:
+        """Stats for primary backends."""
         return [bq.stats.to_dict() for bq in self._backends.values()]
 
+    def all_fallback_stats(self) -> list:
+        """Stats for fallback backends."""
+        return [bq.stats.to_dict() for bq in self._fallback_backends.values()]
+
     def is_healthy(self) -> bool:
-        """Service is healthy if at least one backend is available and can accept requests."""
-        return any(
+        """Service is healthy if at least one backend (primary or fallback) can accept requests."""
+        primary_ok = any(
             bq.is_available and (not bq.is_queue_full() or not bq._semaphore.locked())
             for bq in self._backends.values()
         )
+        if primary_ok:
+            return True
+
+        # Check fallback pool
+        if self._fallback_backends and self._all_primaries_down():
+            return any(
+                bq.is_available and (not bq.is_queue_full() or not bq._semaphore.locked())
+                for bq in self._fallback_backends.values()
+            )
+        return False
 
     @property
     def backend_names(self) -> list:
         return list(self._backends.keys())
+
+    @property
+    def fallback_backend_names(self) -> list:
+        return list(self._fallback_backends.keys())
+
+    @property
+    def has_fallback(self) -> bool:
+        return len(self._fallback_backends) > 0

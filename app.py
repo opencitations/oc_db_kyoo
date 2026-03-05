@@ -12,7 +12,7 @@ from src.health import router as health_router, init_health
 from src.dashboard import router as dashboard_router
 
 
-# ── Logging setup ──────────────────────────────────────────────────────────────
+# -- Logging setup
 
 def setup_logging(level: str):
     log_level = getattr(logging, level.upper(), logging.INFO)
@@ -24,7 +24,7 @@ def setup_logging(level: str):
     )
 
 
-# ── Application ────────────────────────────────────────────────────────────────
+# -- Application
 
 # Global router (initialized at startup)
 _router: Router = None
@@ -41,16 +41,26 @@ async def lifespan(app: FastAPI):
 
     logger = logging.getLogger("oc_db_kyoo")
     logger.info("=" * 60)
-    logger.info("  oc_db_kyoo — Database Queue Manager")
+    logger.info("  oc_db_kyoo - Database Queue Manager")
     logger.info("=" * 60)
     logger.info(f"  Listening on port: {config.listen_port}")
-    logger.info(f"  Backends: {len(config.backends)}")
+    logger.info(f"  Primary backends: {len(config.backends)}")
     for b in config.backends:
-        logger.info(f"    → {b.name}: {b.url}")
+        logger.info(f"    -> {b.name}: {b.url}")
     logger.info(f"  Max concurrent per backend: {config.max_concurrent_per_backend}")
     logger.info(f"  Max queue per backend: {config.max_queue_per_backend}")
     logger.info(f"  Queue timeout: {config.queue_timeout}s")
     logger.info(f"  Backend timeout: {config.backend_timeout}s")
+    if config.fallback_backends:
+        logger.info(f"  Fallback backends: {len(config.fallback_backends)}")
+        for b in config.fallback_backends:
+            logger.info(f"    -> {b.name}: {b.url}")
+        logger.info(f"  Fallback max concurrent: {config.fallback_max_concurrent_per_backend}")
+        logger.info(f"  Fallback max queue: {config.fallback_max_queue_per_backend}")
+        logger.info(f"  Fallback queue timeout: {config.fallback_queue_timeout}s")
+        logger.info(f"  Fallback backend timeout: {config.fallback_backend_timeout}s")
+    else:
+        logger.info("  Fallback backends: none configured")
     logger.info("=" * 60)
 
     # Initialize router and health checks
@@ -100,12 +110,12 @@ async def catch_all(request: Request, path: str):
     return await _router.proxy_request(request)
 
 
-# ── CLI entry point ────────────────────────────────────────────────────────────
+# -- CLI entry point
 
 if __name__ == "__main__":
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="oc_db_kyoo — Database Queue Manager")
+    parser = argparse.ArgumentParser(description="oc_db_kyoo - Database Queue Manager")
     parser.add_argument(
         "--port",
         type=int,
