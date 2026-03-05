@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: oc-db-kyoo-virtuoso
-          image: opencitations/oc_db_kyoo:1.2.0
+          image: opencitations/oc_db_kyoo:$(insert_last_version)
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -71,6 +71,25 @@ spec:
               value: "8890"
             - name: BACKEND_1_PATH
               value: "/sparql"
+            # ── Fallback settings ────────────────────────
+            # Activated only when ALL primary backends have circuit OPEN
+            # - name: FALLBACK_MAX_CONCURRENT_PER_BACKEND
+            #   value: "3"
+            # - name: FALLBACK_MAX_QUEUE_PER_BACKEND
+            #   value: "20"
+            # - name: FALLBACK_QUEUE_TIMEOUT
+            #   value: "120"
+            # - name: FALLBACK_BACKEND_TIMEOUT
+            #   value: "120"
+            # ── Fallback Backend 0 ───────────────────────
+            # - name: FALLBACK_0_NAME
+            #   value: "virtuoso-fb-1"
+            # - name: FALLBACK_0_HOST
+            #   value: "meta-db-virtuoso-fb-1-0.virtuoso-service.default.svc.cluster.local"
+            # - name: FALLBACK_0_PORT
+            #   value: "8890"
+            # - name: FALLBACK_0_PATH
+            #   value: "/sparql"
           # ── Probes ───────────────────────────────────────
           livenessProbe:
             httpGet:
@@ -118,7 +137,7 @@ spec:
 
 
 ---
-#esempio per qlever
+# QLever
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -143,7 +162,7 @@ spec:
     spec:
       containers:
         - name: oc-db-kyoo-qleverindex
-          image: opencitations/oc_db_kyoo:r2test-1.0
+          image: opencitations/oc_db_kyoo:$(insert_last_version)
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -192,6 +211,25 @@ spec:
               value: "7011"
             - name: BACKEND_1_PATH
               value: "/"
+            # ── Fallback settings ────────────────────────
+            # Activated only when ALL primary backends have circuit OPEN
+            # - name: FALLBACK_MAX_CONCURRENT_PER_BACKEND
+            #   value: "3"
+            # - name: FALLBACK_MAX_QUEUE_PER_BACKEND
+            #   value: "20"
+            # - name: FALLBACK_QUEUE_TIMEOUT
+            #   value: "120"
+            # - name: FALLBACK_BACKEND_TIMEOUT
+            #   value: "120"
+            # ── Fallback Backend 0 ───────────────────────
+            # - name: FALLBACK_0_NAME
+            #   value: "index-fb-1"
+            # - name: FALLBACK_0_HOST
+            #   value: "index-db-qlever-fb-1-0.qlever-service.default.svc.cluster.local"
+            # - name: FALLBACK_0_PORT
+            #   value: "7011"
+            # - name: FALLBACK_0_PATH
+            #   value: "/"
           # ── Probes ───────────────────────────────────────
           livenessProbe:
             httpGet:

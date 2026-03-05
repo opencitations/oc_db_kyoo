@@ -247,10 +247,22 @@ class Router:
             backend_queue.release()
 
     async def _try_fallback_backends(self, request: Request, exclude: str) -> Response:
-        """Try other available backends (primary + fallback) if the first choice was full."""
-        # Collect all backend queues from both pools
-        all_queues = list(self.queue_manager._backends.items()) + \
-                     list(self.queue_manager._fallback_backends.items())
+        """
+        Try other available backends if the first choice was full.
+        Respects two-tier routing: tries remaining primaries first,
+        then fallback pool only if ALL primaries have circuit OPEN.
+        Iterates through all candidates before giving up with 503.
+        """
+        # Read body once — Starlette caches it, safe to call multiple times
+        body = await request.body()
+        request_info = _extract_request_info(request, body)
+
+        # First tier: try remaining primary backends
+        all_queues = list(self.queue_manager._backends.items())
+
+        # Second tier: include fallback only if all primaries are down
+        if self.queue_manager._fallback_backends and self.queue_manager._all_primaries_down():
+            all_queues += list(self.queue_manager._fallback_backends.items())
 
         for name, bq in all_queues:
             if name == exclude:
@@ -268,8 +280,6 @@ class Router:
                 continue
 
             backend_config = self._backend_configs[name]
-            body = await request.body()
-            request_info = _extract_request_info(request, body)
             start_time = time.monotonic()
             try:
                 response = await self._forward_request(request, backend_config, body, name)
@@ -277,11 +287,13 @@ class Router:
                 bq.record_success(duration_ms)
                 await bq.record_connection_success()
                 return response
+
             except httpx.ConnectError as e:
                 logger.error(f"[{name}] Fallback connection error: {e}")
                 bq.record_error()
                 await bq.record_connection_failure()
-                return Response(content="Backend error", status_code=502, media_type="text/plain")
+                continue
+
             except httpx.TimeoutException as e:
                 duration_ms = (time.monotonic() - start_time) * 1000
                 logger.warning(
@@ -296,15 +308,14 @@ class Router:
                 )
                 bq.record_error()
                 await bq.record_connection_failure()
-                return Response(
-                    content=f"Backend '{name}' timeout",
-                    status_code=504, media_type="text/plain",
-                )
+                continue
+
             except Exception as e:
                 logger.error(f"[{name}] Fallback error: {e}")
                 bq.record_error()
                 await bq.record_connection_failure()
-                return Response(content="Backend error", status_code=502, media_type="text/plain")
+                continue
+
             finally:
                 bq.release()
 
