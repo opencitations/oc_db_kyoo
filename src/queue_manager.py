@@ -13,7 +13,7 @@ logger = logging.getLogger("oc_db_kyoo")
 class CircuitState(str, Enum):
     CLOSED = "closed"        # Healthy — traffic flows normally
     OPEN = "open"            # Down — no traffic, waiting for probe
-    HALF_OPEN = "half_open"  # Probing — one real request allowed to test
+    HALF_OPEN = "half_open"  # Probing — health checker is confirming recovery
 
 
 @dataclass
@@ -62,7 +62,13 @@ class BackendQueue:
     Circuit breaker states:
       CLOSED    → healthy, traffic flows normally
       OPEN      → backend is down, all requests skip this backend
-      HALF_OPEN → probe succeeded, one real request is allowed through as a test
+      HALF_OPEN → first health probe succeeded, waiting for second confirmation
+
+    Recovery is driven entirely by the health checker:
+      OPEN → (probe OK) → HALF_OPEN → (probe OK) → CLOSED
+      OPEN → (probe OK) → HALF_OPEN → (probe FAIL) → OPEN
+
+    No real user traffic is sent to HALF_OPEN backends.
 
     Queue drain:
       When the circuit transitions to OPEN, a drain event is fired so that
@@ -102,8 +108,8 @@ class BackendQueue:
 
     @property
     def is_available(self) -> bool:
-        """Backend is available for routing if circuit is not open."""
-        return self._circuit_state != CircuitState.OPEN
+        """Backend is available for routing only if circuit is CLOSED."""
+        return self._circuit_state == CircuitState.CLOSED
 
     @property
     def active_requests(self) -> int:
@@ -162,18 +168,18 @@ class BackendQueue:
                     f"consecutive failures — draining {self._queue_count} queued requests"
                 )
             elif self._circuit_state == CircuitState.HALF_OPEN:
-                # The test request failed — back to open
+                # The health check confirmation failed — back to open
                 self._circuit_state = CircuitState.OPEN
                 self.stats.circuit_state = self._circuit_state.value
                 self._drain_event.set()
                 logger.warning(
-                    f"[{self.name}] Circuit back to OPEN — half-open test failed"
+                    f"[{self.name}] Circuit back to OPEN — half-open confirmation failed"
                 )
 
     async def try_transition_to_half_open(self) -> bool:
         """
         Called by the health checker when a probe succeeds on an OPEN backend.
-        Transitions to HALF_OPEN so the next real request can test it.
+        Transitions to HALF_OPEN so the next health check can confirm recovery.
         Returns True if transition happened.
         """
         async with self._circuit_lock:
@@ -186,11 +192,11 @@ class BackendQueue:
 
             self._circuit_state = CircuitState.HALF_OPEN
             self.stats.circuit_state = self._circuit_state.value
-            # Clear drain event so requests can enter the queue again
+            # Clear drain event (no traffic goes here anyway, but keep state clean)
             self._drain_event.clear()
             logger.info(
-                f"[{self.name}] Circuit HALF_OPEN — probe succeeded, "
-                f"allowing one test request"
+                f"[{self.name}] Circuit HALF_OPEN — first probe succeeded, "
+                f"waiting for confirmation"
             )
             return True
 
@@ -199,7 +205,7 @@ class BackendQueue:
         Try to acquire a slot to send a request to this backend.
 
         Returns True if acquired (immediately or after queuing).
-        Returns False if queue is full, circuit is open, or circuit
+        Returns False if queue is full, circuit is not CLOSED, or circuit
         opens while waiting (drain event).
         Raises asyncio.TimeoutError if queue_timeout is exceeded.
 
@@ -207,8 +213,8 @@ class BackendQueue:
         circuit opens, queued requests bail out within ~500ms instead
         of waiting the full queue_timeout (180s).
         """
-        # Fast-fail if circuit is already open
-        if self._circuit_state == CircuitState.OPEN:
+        # Fast-fail if circuit is not CLOSED
+        if self._circuit_state != CircuitState.CLOSED:
             self.stats.total_rejected += 1
             return False
 
@@ -279,8 +285,12 @@ class BackendQueue:
 
 class HealthChecker:
     """
-    Background task that probes OPEN backends with a lightweight query
-    to detect when they recover.
+    Background task that probes OPEN and HALF_OPEN backends with a real
+    SPARQL query to detect and confirm recovery.
+
+    Recovery flow (driven entirely by health checker, no user traffic involved):
+      OPEN → (probe OK) → HALF_OPEN → (probe OK) → CLOSED
+      OPEN → (probe OK) → HALF_OPEN → (probe FAIL) → OPEN
     """
 
     def __init__(self, queue_manager: 'QueueManager', backend_urls: Dict[str, str],
@@ -314,31 +324,30 @@ class HealthChecker:
         logger.info("Health checker stopped")
 
     async def _loop(self):
-        """Main loop: periodically probe backends that are OPEN."""
+        """Main loop: periodically probe backends that need checking."""
         while True:
             try:
                 await asyncio.sleep(self._interval)
-                await self._check_open_backends()
+                await self._check_backends()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Health checker error: {e}")
 
-    async def _check_open_backends(self):
-        """Probe all OPEN backends (primary + fallback) concurrently."""
-        open_backends = [
+    async def _check_backends(self):
+        """Probe all OPEN and HALF_OPEN backends (primary + fallback) concurrently."""
+        check_backends = [
             bq for bq in self._qm._backends.values()
-            if bq.circuit_state == CircuitState.OPEN
+            if bq.circuit_state in (CircuitState.OPEN, CircuitState.HALF_OPEN)
         ]
-        # Also check fallback backends
-        open_backends += [
+        check_backends += [
             bq for bq in self._qm._fallback_backends.values()
-            if bq.circuit_state == CircuitState.OPEN
+            if bq.circuit_state in (CircuitState.OPEN, CircuitState.HALF_OPEN)
         ]
-        if not open_backends:
+        if not check_backends:
             return
 
-        tasks = [self._probe_backend(bq) for bq in open_backends]
+        tasks = [self._probe_backend(bq) for bq in check_backends]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _probe_backend(self, bq: BackendQueue):
@@ -355,21 +364,45 @@ class HealthChecker:
             )
             if resp.status_code < 500:
                 # Any non-5xx means the db process is alive and responding.
-                # Even a 400 (bad query) means the server is up.
-                logger.info(
-                    f"[{bq.name}] Health probe OK (status {resp.status_code})"
-                )
-                await bq.try_transition_to_half_open()
+                if bq.circuit_state == CircuitState.OPEN:
+                    # First probe OK → move to HALF_OPEN
+                    logger.info(
+                        f"[{bq.name}] Health probe OK (status {resp.status_code}) "
+                        f"— moving to HALF_OPEN"
+                    )
+                    await bq.try_transition_to_half_open()
+                elif bq.circuit_state == CircuitState.HALF_OPEN:
+                    # Second probe OK → confirmed, move to CLOSED
+                    logger.info(
+                        f"[{bq.name}] Health probe OK (status {resp.status_code}) "
+                        f"— confirmed recovery, moving to CLOSED"
+                    )
+                    await bq.record_connection_success()
             else:
-                logger.debug(
-                    f"[{bq.name}] Health probe got {resp.status_code} — still down"
-                )
+                # 5xx response
+                if bq.circuit_state == CircuitState.HALF_OPEN:
+                    logger.warning(
+                        f"[{bq.name}] Health probe failed (status {resp.status_code}) "
+                        f"— back to OPEN"
+                    )
+                    await bq.record_connection_failure()
+                else:
+                    logger.debug(
+                        f"[{bq.name}] Health probe got {resp.status_code} — still down"
+                    )
+
         except httpx.ConnectError:
             logger.debug(f"[{bq.name}] Health probe — connection refused")
+            if bq.circuit_state == CircuitState.HALF_OPEN:
+                await bq.record_connection_failure()
         except httpx.TimeoutException:
             logger.debug(f"[{bq.name}] Health probe — timeout")
+            if bq.circuit_state == CircuitState.HALF_OPEN:
+                await bq.record_connection_failure()
         except Exception as e:
             logger.debug(f"[{bq.name}] Health probe — error: {e}")
+            if bq.circuit_state == CircuitState.HALF_OPEN:
+                await bq.record_connection_failure()
 
 
 class QueueManager:
@@ -455,10 +488,13 @@ class QueueManager:
         )
 
     def _select_from_pool(self, pool: Dict[str, BackendQueue]) -> Optional[BackendQueue]:
-        """Pick the least-loaded available backend from a pool."""
+        """Pick the least-loaded available backend from a pool.
+        Only CLOSED backends receive user traffic.
+        HALF_OPEN backends are tested exclusively by the health checker."""
         available = [
             bq for bq in pool.values()
-            if bq.is_available and (not bq.is_queue_full() or not bq._semaphore.locked())
+            if bq.circuit_state == CircuitState.CLOSED
+            and (not bq.is_queue_full() or not bq._semaphore.locked())
         ]
         if not available:
             return None
@@ -467,7 +503,7 @@ class QueueManager:
     def select_backend(self) -> Optional[BackendQueue]:
         """
         Two-tier routing:
-          1. Try primary pool first
+          1. Try primary pool first (CLOSED backends only)
           2. If ALL primaries are down (circuit OPEN), try fallback pool
         """
         primary = self._select_from_pool(self._backends)
@@ -496,7 +532,8 @@ class QueueManager:
     def is_healthy(self) -> bool:
         """Service is healthy if at least one backend (primary or fallback) can accept requests."""
         primary_ok = any(
-            bq.is_available and (not bq.is_queue_full() or not bq._semaphore.locked())
+            bq.circuit_state == CircuitState.CLOSED
+            and (not bq.is_queue_full() or not bq._semaphore.locked())
             for bq in self._backends.values()
         )
         if primary_ok:
@@ -505,7 +542,8 @@ class QueueManager:
         # Check fallback pool
         if self._fallback_backends and self._all_primaries_down():
             return any(
-                bq.is_available and (not bq.is_queue_full() or not bq._semaphore.locked())
+                bq.circuit_state == CircuitState.CLOSED
+                and (not bq.is_queue_full() or not bq._semaphore.locked())
                 for bq in self._fallback_backends.values()
             )
         return False
