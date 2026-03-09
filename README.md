@@ -10,7 +10,7 @@ Database Queue Manager for OpenCitations. Sits between the caching layer (Varnis
 - Queuing excess requests with configurable depth and timeout
 - Routing requests to the least-loaded backend (least-queue strategy)
 - **Circuit breaker** with three states (CLOSED → OPEN → HALF_OPEN) to fast-fail when a backend is unreachable
-- **Active health checking** to detect backend recovery automatically
+- **Active health checking** to detect and confirm backend recovery automatically
 - **Two-tier routing** with a fallback pool that activates when all primary backends are down
 - **Real-time dashboard** for monitoring backend state, circuit status, and queue metrics
 - Returning a friendly "backend busy" page when all backends are saturated
@@ -57,9 +57,9 @@ Service (oc-api, oc-sparql, oc-search, ...)
       "path": "/sparql"
     }
   ],
-  "max_concurrent_per_backend": 10,
-  "max_queue_per_backend": 250,
-  "queue_timeout": 180,
+  "max_concurrent_per_backend": 20,
+  "max_queue_per_backend": 100,
+  "queue_timeout": 60,
   "backend_timeout": 60,
   "circuit_breaker_threshold": 3,
   "circuit_breaker_recovery_time": 15,
@@ -94,7 +94,7 @@ Service (oc-api, oc-sparql, oc-search, ...)
 | `backend_timeout` | Max seconds to wait for a primary backend response | `900` |
 | `circuit_breaker_threshold` | Consecutive connection failures before opening the circuit | `3` |
 | `circuit_breaker_recovery_time` | Seconds to wait before probing an OPEN backend | `15` |
-| `health_check_interval` | Seconds between health check probes on OPEN backends | `10` |
+| `health_check_interval` | Seconds between health check probes on OPEN/HALF_OPEN backends | `10` |
 | `health_check_timeout` | Timeout in seconds for each health check probe | `5` |
 | `health_check_query` | SPARQL query used for health probes | `ASK WHERE { ?s ?p ?o }` |
 | `fallback_backends` | List of fallback backends (activated when all primaries are down) | `[]` |
@@ -154,18 +154,20 @@ The service discovers backends by scanning `BACKEND_N_HOST` and `FALLBACK_N_HOST
 Each backend has an independent circuit breaker with three states:
 
 ```
-        ┌─ success ──────────────────────────────┐
+        ┌─ 2nd probe ok ────────────────────────┐
         │                                        │
     CLOSED ──N failures──▶ OPEN ──probe ok──▶ HALF_OPEN
         ▲                   ▲                    │
-        │                   └── test failed ─────┘
+        │                   └── probe failed ────┘
         │                                        │
-        └──── test succeeded ────────────────────┘
+        └──── 2nd probe ok ─────────────────────┘
 ```
 
 - **CLOSED** — healthy, traffic flows normally.
 - **OPEN** — backend is unreachable. All queued requests are drained immediately (no waiting for `queue_timeout`). New requests skip this backend. A background health checker probes at regular intervals.
-- **HALF_OPEN** — a probe succeeded. One real request is allowed through to test the backend. If it succeeds → CLOSED. If it fails → back to OPEN.
+- **HALF_OPEN** — first health probe succeeded, waiting for confirmation. No user traffic is routed to this backend. The health checker sends a second probe after one interval. If it succeeds → CLOSED. If it fails → back to OPEN.
+
+Recovery is driven entirely by the health checker — no real user requests are involved in the recovery process.
 
 Connection-level failures that trigger the circuit breaker include `ConnectError`, `ConnectTimeout`, `ReadTimeout`, `WriteTimeout`, and any other transport-level `httpx.TimeoutException`. HTTP 4xx/5xx responses do **not** trip the breaker (the database process is alive).
 
@@ -175,20 +177,25 @@ When **all** primary backends have their circuit OPEN, the fallback pool activat
 
 - Fallback backends have their own independent concurrency limits, queue depth, and timeouts.
 - Each fallback backend has its own circuit breaker.
-- As soon as any primary backend recovers (circuit returns to CLOSED or HALF_OPEN), traffic routes back to the primary pool.
+- As soon as any primary backend recovers (circuit returns to CLOSED), traffic routes back to the primary pool.
 
 This two-tier design ensures that reserve capacity is available during full primary outages without affecting normal-operation routing.
 
 ## Health Checker
 
-A background task runs every `health_check_interval` seconds and probes all OPEN backends (both primary and fallback) by sending a lightweight SPARQL query:
+A background task runs every `health_check_interval` seconds and probes all OPEN and HALF_OPEN backends (both primary and fallback) by sending a real SPARQL query:
 
 ```
 GET <backend_url>?query=ASK WHERE { ?s ?p ?o }
 Accept: application/sparql-results+json
 ```
 
-If the probe gets a response with status < 500, the backend is considered alive and transitions to HALF_OPEN. The next real request acts as the final test.
+The health checker drives the full recovery process:
+
+1. **OPEN backend**: If the probe gets a response with status < 500, the backend transitions to HALF_OPEN.
+2. **HALF_OPEN backend**: If the probe gets a response with status < 500, the backend transitions to CLOSED (confirmed recovery). If the probe fails, the backend goes back to OPEN.
+
+This two-step confirmation ensures a backend is reliably responding before it receives user traffic again.
 
 > **Note**: Virtuoso requires `ASK WHERE { ?s ?p ?o }` without `LIMIT`. QLever backends may use a different query via `HEALTH_CHECK_QUERY`.
 
@@ -201,7 +208,7 @@ Backend timeouts are logged to a dedicated file `timeout_requests.log` with full
 | Endpoint | Description |
 |---|---|
 | `/{path}` | Proxy — all requests are forwarded to the least-loaded backend |
-| `/health` | Liveness/readiness probe: 200 if at least one backend (primary or fallback) can accept requests, 503 otherwise |
+| `/health` | Liveness/readiness probe: 200 if at least one CLOSED backend (primary or fallback) can accept requests, 503 otherwise |
 | `/status` | Detailed per-backend queue and circuit breaker statistics (JSON) |
 | `/dashboard` | Real-time monitoring dashboard with auto-refresh (HTML) |
 
@@ -265,14 +272,14 @@ The dashboard shows color-coded cards for each backend with real-time circuit st
 
 1. A request arrives at oc_db_kyoo
 2. The **least-queue router** selects the backend with the lowest total load (active + queued) from the primary pool
-3. Backends with an **OPEN** circuit are skipped entirely
+3. Only backends with a **CLOSED** circuit receive user traffic
 4. If the selected backend has capacity, the request is forwarded immediately
 5. If the backend is at max concurrency, the request enters the backend's queue
-6. If the queue is full, other available backends (including fallback if all primaries are down) are tried
+6. If the queue is full, other available CLOSED backends (including fallback if all primaries are down) are tried
 7. If the circuit **opens** while requests are queued, they are **drained immediately** instead of waiting for the full queue timeout
 8. If all backends are saturated or down, a **503 "Backend Busy"** page is returned
-9. A **health checker** probes OPEN backends periodically and transitions them to HALF_OPEN when they recover
-10. The first real request through a HALF_OPEN backend acts as the final test — if it succeeds, the circuit closes; if it fails, it reopens
+9. A **health checker** probes OPEN and HALF_OPEN backends periodically using a real SPARQL query
+10. Recovery requires two consecutive successful probes: OPEN → HALF_OPEN (first probe OK) → CLOSED (second probe OK). No user traffic is involved in recovery
 
 ## Running
 
