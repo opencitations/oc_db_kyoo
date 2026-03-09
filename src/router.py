@@ -16,6 +16,10 @@ logger = logging.getLogger("oc_db_kyoo")
 timeout_logger = logging.getLogger("oc_db_kyoo.timeouts")
 _timeout_handler_initialized = False
 
+# Dedicated logger for error requests (connection errors, unexpected errors)
+error_logger = logging.getLogger("oc_db_kyoo.errors")
+_error_handler_initialized = False
+
 
 def _init_timeout_logger():
     global _timeout_handler_initialized
@@ -29,6 +33,20 @@ def _init_timeout_logger():
     timeout_logger.addHandler(handler)
     timeout_logger.setLevel(logging.WARNING)
     _timeout_handler_initialized = True
+
+
+def _init_error_logger():
+    global _error_handler_initialized
+    if _error_handler_initialized:
+        return
+    handler = logging.FileHandler("error_requests.log", mode="a")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    error_logger.addHandler(handler)
+    error_logger.setLevel(logging.WARNING)
+    _error_handler_initialized = True
 
 
 def _extract_request_info(request: Request, body: bytes) -> dict:
@@ -158,6 +176,7 @@ class Router:
             self._fallback_client = None
 
         _init_timeout_logger()
+        _init_error_logger()
 
     def _get_client(self, backend_name: str) -> httpx.AsyncClient:
         """Return the appropriate HTTP client for the backend."""
@@ -210,7 +229,16 @@ class Router:
             return response
 
         except httpx.ConnectError as e:
+            duration_ms = (time.monotonic() - start_time) * 1000
             logger.error(f"[{backend_name}] Connection error: {e}")
+            error_logger.warning(
+                f"[CONN_ERROR] [{backend_name}] {duration_ms:.0f}ms | "
+                f"client={request_info['client']} | "
+                f"user_agent={request_info['user_agent']}\n"
+                f"{type(e).__name__}: {e}\n"
+                f"{request_info['query']}\n"
+                f"{'─' * 80}"
+            )
             backend_queue.record_error()
             await backend_queue.record_connection_failure()
             return Response(
@@ -236,7 +264,16 @@ class Router:
                 status_code=504, media_type="text/plain",
             )
         except Exception as e:
+            duration_ms = (time.monotonic() - start_time) * 1000
             logger.error(f"[{backend_name}] Unexpected error: {e}")
+            error_logger.warning(
+                f"[ERROR] [{backend_name}] {duration_ms:.0f}ms | "
+                f"client={request_info['client']} | "
+                f"user_agent={request_info['user_agent']}\n"
+                f"{type(e).__name__}: {e}\n"
+                f"{request_info['query']}\n"
+                f"{'─' * 80}"
+            )
             backend_queue.record_error()
             await backend_queue.record_connection_failure()
             return Response(
@@ -289,7 +326,16 @@ class Router:
                 return response
 
             except httpx.ConnectError as e:
+                duration_ms = (time.monotonic() - start_time) * 1000
                 logger.error(f"[{name}] Fallback connection error: {e}")
+                error_logger.warning(
+                    f"[CONN_ERROR] [{name}] (fallback) {duration_ms:.0f}ms | "
+                    f"client={request_info['client']} | "
+                    f"user_agent={request_info['user_agent']}\n"
+                    f"{type(e).__name__}: {e}\n"
+                    f"{request_info['query']}\n"
+                    f"{'─' * 80}"
+                )
                 bq.record_error()
                 await bq.record_connection_failure()
                 continue
@@ -311,7 +357,16 @@ class Router:
                 continue
 
             except Exception as e:
+                duration_ms = (time.monotonic() - start_time) * 1000
                 logger.error(f"[{name}] Fallback error: {e}")
+                error_logger.warning(
+                    f"[ERROR] [{name}] (fallback) {duration_ms:.0f}ms | "
+                    f"client={request_info['client']} | "
+                    f"user_agent={request_info['user_agent']}\n"
+                    f"{type(e).__name__}: {e}\n"
+                    f"{request_info['query']}\n"
+                    f"{'─' * 80}"
+                )
                 bq.record_error()
                 await bq.record_connection_failure()
                 continue
