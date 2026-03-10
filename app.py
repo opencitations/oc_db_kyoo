@@ -93,7 +93,7 @@ app.include_router(health_router)
 app.include_router(dashboard_router)
 
 # Reserved paths that must not be proxied to backends
-RESERVED_PATHS = {"health", "status", "dashboard"}
+RESERVED_PATHS = {"health", "ready", "status", "dashboard"}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "HEAD", "OPTIONS"])

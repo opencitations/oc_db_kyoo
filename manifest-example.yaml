@@ -91,22 +91,22 @@ spec:
             # - name: FALLBACK_0_PATH
             #   value: "/sparql"
           # ── Probes ───────────────────────────────────────
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            initialDelaySeconds: 15
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
           # ── Resources ────────────────────────────────────
           resources:
             requests:
