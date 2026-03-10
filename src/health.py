@@ -17,12 +17,41 @@ def init_health(queue_manager: QueueManager):
     _queue_manager = queue_manager
 
 
+@router.get("/ready")
+async def ready():
+    """
+    Kubernetes liveness and readiness probe.
+    Returns 200 if the oc_db_kyoo process is running and initialized.
+    Returns 503 only during startup before initialization completes.
+
+    This does NOT check backend health — that way the pod stays in the
+    Service even when all backends are down, allowing oc_db_kyoo to
+    respond with a proper "503 Backend Busy" page instead of
+    "Connection refused".
+
+    If the process is frozen/dead, this endpoint won't respond at all,
+    and Kubernetes will kill the pod via liveness timeout.
+    """
+    if _queue_manager is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Service not initialized"}
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ready"}
+    )
+
+
 @router.get("/health")
 async def health():
     """
-    Liveness/readiness probe for Kubernetes.
+    Backend health check for monitoring and dashboards.
     Returns 200 if at least one backend (primary or fallback) can accept requests.
-    Returns 503 if all backends are overloaded.
+    Returns 503 if all backends are overloaded or have circuit OPEN.
+
+    NOT used by Kubernetes probes — use /ready for that.
     """
     if _queue_manager is None:
         return JSONResponse(
