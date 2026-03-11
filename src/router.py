@@ -10,6 +10,11 @@ from fastapi.responses import HTMLResponse
 from src.config import AppConfig, BackendConfig
 from src.queue_manager import QueueManager, BackendQueue, HealthChecker
 
+# gzip rotating file handler
+import gzip
+import os
+from logging.handlers import RotatingFileHandler
+
 logger = logging.getLogger("oc_db_kyoo")
 
 # Dedicated logger for timeout requests
@@ -20,12 +25,29 @@ _timeout_handler_initialized = False
 error_logger = logging.getLogger("oc_db_kyoo.errors")
 _error_handler_initialized = False
 
+class GzipRotatingFileHandler(RotatingFileHandler):
+    def doRollover(self):
+        super().doRollover()
+        
+        if self.backupCount > 0:
+            for i in range(1, self.backupCount + 1):
+                old_log = f"{self.baseFilename}.{i}"
+                if os.path.exists(old_log):
+                    with open(old_log, 'rb') as f_in:
+                        with gzip.open(f"{old_log}.gz", 'wb') as f_out:
+                            f_out.writelines(f_in)
+                    os.remove(old_log)  
 
 def _init_timeout_logger():
     global _timeout_handler_initialized
     if _timeout_handler_initialized:
         return
-    handler = logging.FileHandler("timeout_requests.log", mode="a")
+    handler = GzipRotatingFileHandler(
+        "timeout_requests.log", 
+        mode="a",
+        maxBytes=20 * 1024 * 1024,  # 20MB
+        backupCount=5  # Numero di backup da mantenere
+    )
     handler.setFormatter(logging.Formatter(
         "%(asctime)s [TIMEOUT] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
