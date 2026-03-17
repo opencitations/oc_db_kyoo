@@ -234,12 +234,11 @@ class Router:
             logger.warning(f"Queue timeout for backend '{backend_name}'")
             return HTMLResponse(content=BUSY_HTML, status_code=503)
 
-        # Read body early so we can log it on timeout
-        body = await request.body()
-        request_info = _extract_request_info(request, body)
-
         start_time = time.monotonic()
         try:
+            # Read body inside try/finally so release() is guaranteed
+            body = await request.body()
+            request_info = _extract_request_info(request, body)
             response = await self._forward_request(request, backend_config, body, backend_name)
             duration_ms = (time.monotonic() - start_time) * 1000
             backend_queue.record_success(duration_ms)
